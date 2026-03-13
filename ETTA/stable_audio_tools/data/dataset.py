@@ -618,6 +618,101 @@ class SampleDataset(torch.utils.data.Dataset):
             return self[random.randrange(len(self))]
 
 
+class PreEncodedDataset(torch.utils.data.Dataset):
+    def __init__(
+            self,
+            configs: List[LocalDatasetConfig],
+            latent_crop_length=None,
+            min_length_sec=None,
+            max_length_sec=None,
+            random_crop=False,
+            latent_extension='npy'
+    ):
+        super().__init__()
+        self.filenames = []
+
+        self.custom_metadata_fns = {}
+
+        self.latent_extension = latent_extension
+
+        for config in configs:
+            self.filenames.extend(get_latent_filenames(config.path, [latent_extension]))
+            if config.custom_metadata_fn is not None:
+                self.custom_metadata_fns[config.path] = config.custom_metadata_fn
+
+        self.latent_crop_length = latent_crop_length
+        self.random_crop = random_crop
+
+        self.min_length_sec = min_length_sec
+        self.max_length_sec = max_length_sec
+
+        print(f'Found {len(self.filenames)} files')
+
+    def __len__(self):
+        return len(self.filenames)
+
+    def __getitem__(self, idx):
+        latent_filename = self.filenames[idx]
+        try:
+            latents = torch.from_numpy(np.load(latent_filename))  # [C, N]
+
+            md_filename = latent_filename.replace(f".{self.latent_extension}", ".json")
+
+            with open(md_filename, "r") as f:
+                try:
+                    info = json.load(f)
+                except:
+                    raise Exception(f"Couldn't load metadata file {md_filename}")
+
+            info["latent_filename"] = latent_filename
+
+            if self.latent_crop_length is not None:
+
+                # Get the last index from the padding mask, the index of the last 1 in the sequence
+                last_ix = len(info["padding_mask"]) - 1 - info["padding_mask"][::-1].index(1)
+
+                if self.random_crop and last_ix > self.latent_crop_length:
+                    start = random.randint(0, last_ix - self.latent_crop_length)
+                else:
+                    start = 0
+
+                latents = latents[:, start:start + self.latent_crop_length]
+
+                info["padding_mask"] = info["padding_mask"][start:start + self.latent_crop_length]
+
+                info["latent_crop_length"] = self.latent_crop_length
+                info["latent_crop_start"] = start
+
+            info["padding_mask"] = [torch.tensor(info["padding_mask"])]
+
+            seconds_total = info["seconds_total"]
+
+            if self.min_length_sec is not None and seconds_total < self.min_length_sec:
+                return self[random.randrange(len(self))]
+
+            if self.max_length_sec is not None and seconds_total > self.max_length_sec:
+                return self[random.randrange(len(self))]
+
+            for custom_md_path in self.custom_metadata_fns.keys():
+                if custom_md_path in latent_filename:
+                    custom_metadata_fn = self.custom_metadata_fns[custom_md_path]
+                    custom_metadata = custom_metadata_fn(info, None)
+                    info.update(custom_metadata)
+
+                if "__reject__" in info and info["__reject__"]:
+                    return self[random.randrange(len(self))]
+
+                if "__replace__" in info and info["__replace__"] is not None:
+                    # Replace the latents with the new latents if the custom metadata function returns a new set of latents
+                    latents = info["__replace__"]
+
+            info["audio"] = latents
+
+            return (latents, info)
+        except Exception as e:
+            print(f'Couldn\'t load file {latent_filename}: {e}')
+            return self[random.randrange(len(self))]
+
 def group_by_keys(
     data, keys=wds.tariterators.base_plus_ext, lcase=True, suffixes=None, handler=None
 ):
@@ -905,6 +1000,98 @@ def create_dataloader_from_config(
         list_valid_dl = []  # assumes no validation dataloaders for now
 
         return train_dl, list_valid_dl
+
+    elif dataset_type == "pre_encoded":
+
+        pre_encoded_dir_configs = dataset_config.get("datasets", None)
+
+        assert pre_encoded_dir_configs is not None, "Directory configuration must be specified in datasets[\"dataset\"]"
+
+        latent_crop_length = dataset_config.get("latent_crop_length", None)
+        min_length_sec = dataset_config.get("min_length_sec", None)
+        max_length_sec = dataset_config.get("max_length_sec", None)
+        random_crop = dataset_config.get("random_crop", False)
+        latent_extension = dataset_config.get("latent_extension", 'npy')
+
+        configs = []
+
+        for pre_encoded_dir_config in pre_encoded_dir_configs:
+            pre_encoded_dir_path = pre_encoded_dir_config.get("path", None)
+            assert pre_encoded_dir_path is not None, "Path must be set for local audio directory configuration"
+
+            custom_metadata_fn = None
+            custom_metadata_module_path = pre_encoded_dir_config.get("custom_metadata_module", None)
+
+            if custom_metadata_module_path is not None:
+                spec = importlib.util.spec_from_file_location("metadata_module", custom_metadata_module_path)
+                metadata_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(metadata_module)
+
+                custom_metadata_fn = metadata_module.get_custom_metadata
+
+            configs.append(
+                LocalDatasetConfig(
+                    id=pre_encoded_dir_config["id"],
+                    path=pre_encoded_dir_path,
+                    n_repeats=0,
+                    custom_metadata_fn=custom_metadata_fn
+                )
+            )
+
+        train_set = PreEncodedDataset(
+            configs,
+            latent_crop_length=latent_crop_length,
+            min_length_sec=min_length_sec,
+            max_length_sec=max_length_sec,
+            random_crop=random_crop,
+            latent_extension=latent_extension
+        )
+
+        train_dl = torch.utils.data.DataLoader(train_set, batch_size, shuffle=shuffle,
+                                           num_workers=num_workers, persistent_workers=True, pin_memory=True,
+                                           drop_last=dataset_config.get("drop_last", True), collate_fn=collation_fn)
+
+        # create validation data configs and valid sets. Note that datasets_valid is list of list
+        pre_encoded_dir_configs_valid = dataset_config.get("datasets_valid", None)
+        list_valid_dl = []
+
+        for pre_encoded_dir_config_valid in pre_encoded_dir_configs_valid:
+            pre_encoded_dir_path = pre_encoded_dir_config_valid.get("path", None)
+            assert pre_encoded_dir_path is not None, "Path must be set for local audio directory configuration"
+
+            custom_metadata_fn = None
+            custom_metadata_module_path = pre_encoded_dir_config_valid.get("custom_metadata_module", None)
+
+            if custom_metadata_module_path is not None:
+                spec = importlib.util.spec_from_file_location("metadata_module", custom_metadata_module_path)
+                metadata_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(metadata_module)
+
+                custom_metadata_fn = metadata_module.get_custom_metadata
+
+            configs.append(
+                LocalDatasetConfig(
+                    id=pre_encoded_dir_config_valid["id"],
+                    path=pre_encoded_dir_path,
+                    n_repeats=0,
+                    custom_metadata_fn=custom_metadata_fn
+                )
+            )
+
+        val_set = PreEncodedDataset(
+            configs,
+            latent_crop_length=latent_crop_length,
+            min_length_sec=min_length_sec,
+            max_length_sec=max_length_sec,
+            random_crop=random_crop,
+            latent_extension=latent_extension
+        )
+
+        val_dl = torch.utils.data.DataLoader(val_set, batch_size, shuffle=False,
+                                           num_workers=num_workers, persistent_workers=True, pin_memory=True,
+                                           drop_last=dataset_config.get("drop_last", False), collate_fn=collation_fn)
+
+        return train_dl, [val_dl]
 
     else:
         raise NotImplementedError
