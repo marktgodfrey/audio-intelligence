@@ -9,6 +9,8 @@ import torch
 import pytorch_lightning as pl
 import random
 
+from prefigure.prefigure import push_wandb_config
+
 from stable_audio_tools.data.dataset import create_dataloader_from_config
 from stable_audio_tools.models import create_model_from_config
 from stable_audio_tools.models.utils import load_ckpt_state_dict, remove_weight_norm_from_model
@@ -174,7 +176,9 @@ def main(args):
         copy_state_dict(training_wrapper, load_ckpt_state_dict(args.wrapper_ckpt_path))
     
     # use tensorboard for logging
-    tensorboard_logger = pl.loggers.TensorBoardLogger(save_dir=args.save_dir, name=args.name, version='', sub_dir="tb_logs")
+    # tensorboard_logger = pl.loggers.TensorBoardLogger(save_dir=args.save_dir, name=args.name, version='', sub_dir="tb_logs")
+    logger = pl.loggers.WandbLogger(project=args.name)
+    logger.watch(training_wrapper, log="gradients", log_freq=10000, log_graph=False)
 
     exc_callback = ExceptionCallback()
     
@@ -230,6 +234,8 @@ def main(args):
     # Combine args and model_config dicts so far used. This defines all params except dataset_config
     args_dict = vars(args)
     args_dict.update({"model_config": model_config})
+    args_dict.update({"dataset_config": dataset_config})
+    push_wandb_config(logger, args_dict)
 
     # print config & model on rank zero
     if int(os.environ["RANK"]) == 0:
@@ -253,7 +259,7 @@ def main(args):
         precision=args.precision,
         accumulate_grad_batches=args.accum_batches, 
         callbacks=[ckpt_callback, timed_ckpt_callback, demo_callback, exc_callback, save_model_config_callback, early_stopping_callback],
-        logger=tensorboard_logger,
+        logger=logger,
         log_every_n_steps=1,
         check_val_every_n_epoch=None,
         val_check_interval=model_config.training.demo.demo_every, # use demo_every for validation loss tracking.
