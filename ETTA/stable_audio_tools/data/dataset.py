@@ -6,7 +6,10 @@ import importlib
 import numpy as np
 import io
 import os
+import posixpath
 import random
+import re
+import subprocess
 import time
 import torch
 import torchaudio
@@ -241,6 +244,31 @@ def get_audio_filenames(
     return filenames, num_files_per_dir
 
 
+def get_latent_filenames(
+    paths: list,
+    extensions=["npy"],
+):
+    "recursively get a list of pre-encoded filenames"
+    filenames = []
+
+    if type(paths) is str:
+        paths = [paths]
+
+    for path in paths:
+        filelist_path = os.path.join(path, "filelist.txt")
+
+        if os.path.exists(filelist_path):
+            with open(filelist_path, "r") as f:
+                files = [os.path.join(path, file.strip()) for file in f.readlines()]
+                filenames.extend(files)
+            continue
+
+        _, files = fast_scandir(0, path, extensions)
+        filenames.extend(files)
+
+    return filenames
+
+
 class LocalDatasetConfig:
     def __init__(
         self,
@@ -257,6 +285,47 @@ class LocalDatasetConfig:
         self.n_repeats = n_repeats
         self.custom_metadata_fn = custom_metadata_fn
         self.metadata = metadata
+
+
+class LocalWebDatasetConfig:
+    def __init__(
+        self,
+        id: str,
+        path: str,
+        custom_metadata_fn: Optional[Callable[[str], str]] = None,
+    ):
+        self.id = id
+        self.path = path
+        self.custom_metadata_fn = custom_metadata_fn
+        self.urls = []
+
+    def load_data_urls(self):
+        _, self.urls = fast_scandir(0, self.path, ["tar"])
+        return self.urls
+
+
+class S3DatasetConfig:
+    def __init__(
+        self,
+        id: str,
+        s3_path: str,
+        custom_metadata_fn: Optional[Callable[[str], str]] = None,
+        profile: Optional[str] = None,
+    ):
+        self.id = id
+        self.path = s3_path
+        self.custom_metadata_fn = custom_metadata_fn
+        self.profile = profile
+        self.urls = []
+
+    def load_data_urls(self):
+        self.urls = get_all_s3_urls(
+            names=[self.path],
+            s3_url_prefix=None,
+            recursive=True,
+            profiles={self.path: self.profile} if self.profile else {},
+        )
+        return self.urls
 
 
 class SampleDataset(torch.utils.data.Dataset):
@@ -713,6 +782,353 @@ class PreEncodedDataset(torch.utils.data.Dataset):
             print(f'Couldn\'t load file {latent_filename}: {e}')
             return self[random.randrange(len(self))]
 
+
+def get_dbmax(audio):
+    "finds the loudest value in the entire clip and puts that into dB (full scale)"
+    return 20 * torch.log10(torch.flatten(audio.abs()).max()).cpu().numpy()
+
+
+def is_silence(audio, thresh=-60):
+    "checks if entire clip is 'silence' below some dB threshold"
+    dBmax = get_dbmax(audio)
+    return dBmax < thresh
+
+
+def get_s3_contents(
+    dataset_path,
+    s3_url_prefix=None,
+    filter="",
+    recursive=True,
+    debug=False,
+    profile=None,
+):
+    """
+    Returns a list of full S3 paths to files in a given S3 bucket and directory path.
+    """
+    if dataset_path != "" and not dataset_path.endswith("/"):
+        dataset_path += "/"
+
+    bucket_path = posixpath.join(s3_url_prefix or "", dataset_path)
+    cmd = ["aws", "s3", "ls", bucket_path]
+
+    if profile is not None:
+        cmd.extend(["--profile", profile])
+
+    if recursive:
+        cmd.append("--recursive")
+
+    run_ls = subprocess.run(cmd, capture_output=True, check=True)
+    contents = run_ls.stdout.decode("utf-8").split("\n")
+    contents = [x.strip() for x in contents if x]
+    contents = [
+        re.sub(r"^\S+\s+\S+\s+\d+\s+", "", x)
+        if re.match(r"^\S+\s+\S+\s+\d+\s+", x)
+        else x
+        for x in contents
+    ]
+    contents = [
+        posixpath.join(s3_url_prefix or "", x) for x in contents if not x.endswith("/")
+    ]
+
+    if filter:
+        contents = [x for x in contents if filter in x]
+
+    if recursive:
+        main_dir = "/".join(bucket_path.split("/")[3:])
+        contents = [x.replace(f"{main_dir}", "").replace("//", "/") for x in contents]
+
+    if debug:
+        print("contents = \n", contents)
+
+    return contents
+
+
+def get_all_s3_urls(
+    names=[],
+    subsets=[""],
+    s3_url_prefix=None,
+    recursive=True,
+    filter_str="tar",
+    debug=False,
+    profiles={},
+):
+    "get urls of shards (tar files) for multiple datasets in one s3 bucket"
+    urls = []
+
+    for name in names:
+        if s3_url_prefix is None:
+            contents_str = name
+        else:
+            contents_str = posixpath.join(s3_url_prefix, name)
+
+        if debug:
+            print(f"get_all_s3_urls: {contents_str}:")
+
+        for subset in subsets:
+            subset_str = posixpath.join(contents_str, subset)
+            if debug:
+                print(f"subset_str = {subset_str}")
+
+            profile = profiles.get(name, None)
+            tar_list = get_s3_contents(
+                subset_str,
+                s3_url_prefix=None,
+                recursive=recursive,
+                filter=filter_str,
+                debug=debug,
+                profile=profile,
+            )
+
+            for tar in tar_list:
+                tar = tar.replace(" ", r"\ ").replace("(", r"\(").replace(")", r"\)")
+                s3_path = posixpath.join(name, subset, tar) + " -"
+
+                if s3_url_prefix is None:
+                    request_str = f"pipe:aws s3 --cli-connect-timeout 0 cp {s3_path}"
+                else:
+                    request_str = (
+                        f"pipe:aws s3 --cli-connect-timeout 0 cp "
+                        f"{posixpath.join(s3_url_prefix, s3_path)}"
+                    )
+
+                if profiles.get(name):
+                    request_str += f" --profile {profiles.get(name)}"
+
+                if debug:
+                    print("request_str = ", request_str)
+
+                urls.append(request_str)
+
+    return urls
+
+
+def log_and_continue(exn):
+    print(f"Handling webdataset error ({repr(exn)}). Ignoring.")
+    return True
+
+
+def is_valid_sample(sample):
+    if sample is None or not isinstance(sample, dict):
+        return False
+
+    has_json = "json" in sample
+    has_audio = "audio" in sample
+    is_pre_encoded = sample.get("__pre_encoded__", False)
+    is_silent = has_audio and (not is_pre_encoded) and is_silence(sample["audio"])
+    is_rejected = has_json and "__reject__" in sample["json"] and sample["json"]["__reject__"]
+
+    return has_json and has_audio and not is_silent and not is_rejected
+
+
+class WebDatasetDataLoader:
+    def __init__(
+        self,
+        datasets: List[LocalWebDatasetConfig],
+        batch_size,
+        sample_size,
+        sample_rate=48000,
+        num_workers=8,
+        epoch_steps=1000,
+        random_crop=True,
+        force_channels="stereo",
+        augment_phase=True,
+        pre_encoded=False,
+        latent_crop_length=None,
+        latent_extension="npy",
+        min_length_sec=None,
+        max_length_sec=None,
+        resampled_shards=True,
+        **data_loader_kwargs,
+    ):
+        self.datasets = datasets
+        self.sample_size = sample_size
+        self.sample_rate = sample_rate
+        self.random_crop = random_crop
+        self.force_channels = force_channels
+        self.augment_phase = augment_phase
+        self.pre_encoded = pre_encoded
+        self.latent_crop_length = latent_crop_length
+        self.latent_extension = latent_extension.lower().lstrip(".")
+        self.min_length_sec = min_length_sec
+        self.max_length_sec = max_length_sec
+
+        urls = [dataset.load_data_urls() for dataset in datasets]
+        urls = [url for dataset_urls in urls for url in dataset_urls]
+        random.shuffle(urls)
+
+        self.dataset = wds.DataPipeline(
+            wds.ResampledShards(urls) if resampled_shards else wds.SimpleShardList(urls),
+            wds.tarfile_to_samples(handler=log_and_continue),
+            wds.decode(self._decoder(), handler=log_and_continue),
+            wds.map(self.wds_preprocess, handler=log_and_continue),
+            wds.select(is_valid_sample),
+            wds.to_tuple("audio", "json", handler=log_and_continue),
+            wds.batched(batch_size, partial=False, collation_fn=collation_fn),
+        )
+
+        if resampled_shards:
+            self.dataset = self.dataset.with_epoch(
+                epoch_steps // num_workers if num_workers > 0 else epoch_steps
+            )
+
+        def worker_init_fn(worker_id):
+            torch.multiprocessing.set_sharing_strategy("file_system")
+
+        self.data_loader = wds.WebLoader(
+            self.dataset,
+            num_workers=num_workers,
+            worker_init_fn=worker_init_fn,
+            **data_loader_kwargs,
+        )
+
+    def _decoder(self):
+        if not self.pre_encoded:
+            return audio_decoder
+
+        latent_extension = self.latent_extension
+
+        def latent_decoder(key, value):
+            ext = key.split(".")[-1].lower()
+            if ext == latent_extension:
+                return np.lib.format.read_array(io.BytesIO(value))
+            return None
+
+        return latent_decoder
+
+    def _apply_pre_encoded_rules(self, latents, info, source_path, custom_metadata_fn):
+        info = dict(info)
+        info["latent_filename"] = source_path
+
+        if self.latent_crop_length is not None:
+            last_ix = len(info["padding_mask"]) - 1 - info["padding_mask"][::-1].index(1)
+
+            if self.random_crop and last_ix > self.latent_crop_length:
+                start = random.randint(0, last_ix - self.latent_crop_length)
+            else:
+                start = 0
+
+            latents = latents[:, start : start + self.latent_crop_length]
+            info["padding_mask"] = info["padding_mask"][start : start + self.latent_crop_length]
+            info["latent_crop_length"] = self.latent_crop_length
+            info["latent_crop_start"] = start
+
+        info["padding_mask"] = [torch.tensor(info["padding_mask"])]
+
+        seconds_total = info["seconds_total"]
+
+        if self.min_length_sec is not None and seconds_total < self.min_length_sec:
+            info["__reject__"] = True
+
+        if self.max_length_sec is not None and seconds_total > self.max_length_sec:
+            info["__reject__"] = True
+
+        if custom_metadata_fn is not None:
+            custom_metadata = custom_metadata_fn(info, None)
+            info.update(custom_metadata)
+
+            if "__replace__" in info and info["__replace__"] is not None:
+                latents = info["__replace__"]
+
+        info["audio"] = latents
+
+        return latents, info
+
+    def wds_preprocess(self, sample):
+        if self.pre_encoded:
+            audio = None
+            found_key = self.latent_extension
+
+            for key in list(sample.keys()):
+                if key.endswith(self.latent_extension):
+                    found_key = key
+                    break
+
+            if found_key not in sample:
+                return None
+
+            audio = torch.from_numpy(sample[found_key])
+            del sample[found_key]
+            sample["__pre_encoded__"] = True
+        else:
+            found_key = ""
+            for key in sample.keys():
+                for akey in AUDIO_KEYS:
+                    if key.endswith(akey):
+                        found_key = key
+                        break
+                if found_key:
+                    break
+
+            if not found_key:
+                return None
+
+            audio, in_sr = sample[found_key]
+            if in_sr != self.sample_rate:
+                resample_tf = T.Resample(in_sr, self.sample_rate)
+                audio = resample_tf(audio)
+
+            if self.sample_size is not None:
+                pad_crop = PadCrop_Normalized_T(
+                    self.sample_size,
+                    randomize=self.random_crop,
+                    sample_rate=self.sample_rate,
+                )
+                audio, t_start, t_end, seconds_start, seconds_total, padding_mask = pad_crop(audio)
+                sample["json"]["seconds_start"] = seconds_start
+                sample["json"]["seconds_total"] = seconds_total
+                sample["json"]["padding_mask"] = padding_mask
+            else:
+                t_start, t_end = 0, 1
+
+            if audio.shape[-1] == 0:
+                audio = torch.zeros(1, 1)
+
+            augs = torch.nn.Sequential(
+                Stereo() if self.force_channels == "stereo" else torch.nn.Identity(),
+                Mono() if self.force_channels == "mono" else torch.nn.Identity(),
+                PhaseFlipper() if self.augment_phase else torch.nn.Identity(),
+            )
+            audio = augs(audio)
+            sample["json"]["timestamps"] = (t_start, t_end)
+            sample["json"]["audio"] = audio
+
+        if "text" in sample["json"]:
+            sample["json"]["prompt"] = sample["json"]["text"]
+
+        matched_dataset = None
+        for dataset in self.datasets:
+            if dataset.path not in sample["__url__"]:
+                continue
+
+            matched_dataset = dataset
+
+            if self.pre_encoded:
+                audio, info = self._apply_pre_encoded_rules(
+                    audio,
+                    sample["json"],
+                    sample["__key__"],
+                    dataset.custom_metadata_fn,
+                )
+                sample["json"] = info
+                break
+            elif dataset.custom_metadata_fn is not None:
+                custom_metadata = dataset.custom_metadata_fn(sample["json"], audio)
+                sample["json"].update(custom_metadata)
+
+        if self.pre_encoded and matched_dataset is None:
+            audio, info = self._apply_pre_encoded_rules(
+                audio,
+                sample["json"],
+                sample["__key__"],
+                None,
+            )
+            sample["json"] = info
+
+        sample["audio"] = audio
+        sample["json"]["audio"] = audio
+
+        return sample
+
 def group_by_keys(
     data, keys=wds.tariterators.base_plus_ext, lcase=True, suffixes=None, handler=None
 ):
@@ -1047,51 +1463,130 @@ def create_dataloader_from_config(
             latent_extension=latent_extension
         )
 
-        train_dl = torch.utils.data.DataLoader(train_set, batch_size, shuffle=shuffle,
-                                           num_workers=num_workers, persistent_workers=True, pin_memory=True,
-                                           drop_last=dataset_config.get("drop_last", True), collate_fn=collation_fn)
+        train_dl = torch.utils.data.DataLoader(
+            train_set,
+            batch_size,
+            shuffle=dataset_config.get("shuffle", True),
+            num_workers=num_workers,
+            persistent_workers=True,
+            pin_memory=True,
+            drop_last=dataset_config.get("drop_last", True),
+            collate_fn=collation_fn,
+        )
 
         # create validation data configs and valid sets. Note that datasets_valid is list of list
         pre_encoded_dir_configs_valid = dataset_config.get("datasets_valid", None)
         list_valid_dl = []
 
-        for pre_encoded_dir_config_valid in pre_encoded_dir_configs_valid:
-            pre_encoded_dir_path = pre_encoded_dir_config_valid.get("path", None)
-            assert pre_encoded_dir_path is not None, "Path must be set for local audio directory configuration"
+        if pre_encoded_dir_configs_valid is not None:
+            configs_valid = []
 
-            custom_metadata_fn = None
-            custom_metadata_module_path = pre_encoded_dir_config_valid.get("custom_metadata_module", None)
+            for pre_encoded_dir_config_valid in pre_encoded_dir_configs_valid:
+                pre_encoded_dir_path = pre_encoded_dir_config_valid.get("path", None)
+                assert pre_encoded_dir_path is not None, "Path must be set for local audio directory configuration"
 
-            if custom_metadata_module_path is not None:
-                spec = importlib.util.spec_from_file_location("metadata_module", custom_metadata_module_path)
-                metadata_module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(metadata_module)
+                custom_metadata_fn = None
+                custom_metadata_module_path = pre_encoded_dir_config_valid.get("custom_metadata_module", None)
 
-                custom_metadata_fn = metadata_module.get_custom_metadata
+                if custom_metadata_module_path is not None:
+                    spec = importlib.util.spec_from_file_location("metadata_module", custom_metadata_module_path)
+                    metadata_module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(metadata_module)
 
-            configs.append(
-                LocalDatasetConfig(
-                    id=pre_encoded_dir_config_valid["id"],
-                    path=pre_encoded_dir_path,
-                    n_repeats=0,
-                    custom_metadata_fn=custom_metadata_fn
+                    custom_metadata_fn = metadata_module.get_custom_metadata
+
+                configs_valid.append(
+                    LocalDatasetConfig(
+                        id=pre_encoded_dir_config_valid["id"],
+                        path=pre_encoded_dir_path,
+                        n_repeats=0,
+                        custom_metadata_fn=custom_metadata_fn
+                    )
                 )
+
+            val_set = PreEncodedDataset(
+                configs_valid,
+                latent_crop_length=latent_crop_length,
+                min_length_sec=min_length_sec,
+                max_length_sec=max_length_sec,
+                random_crop=random_crop,
+                latent_extension=latent_extension
             )
 
-        val_set = PreEncodedDataset(
-            configs,
-            latent_crop_length=latent_crop_length,
-            min_length_sec=min_length_sec,
-            max_length_sec=max_length_sec,
-            random_crop=random_crop,
-            latent_extension=latent_extension
-        )
+            val_dl = torch.utils.data.DataLoader(
+                val_set,
+                batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                persistent_workers=True,
+                pin_memory=True,
+                drop_last=dataset_config.get("drop_last", False),
+                collate_fn=collation_fn,
+            )
+            list_valid_dl.append(val_dl)
 
-        val_dl = torch.utils.data.DataLoader(val_set, batch_size, shuffle=False,
-                                           num_workers=num_workers, persistent_workers=True, pin_memory=True,
-                                           drop_last=dataset_config.get("drop_last", False), collate_fn=collation_fn)
+        return train_dl, list_valid_dl
 
-        return train_dl, [val_dl]
+    elif dataset_type in ["wds", "s3"]:
+
+        wds_configs = []
+
+        for wds_config in dataset_config["datasets"]:
+            custom_metadata_fn = None
+            custom_metadata_module_path = wds_config.get("custom_metadata_module", None)
+
+            if custom_metadata_module_path is not None:
+                spec = importlib.util.spec_from_file_location(
+                    "metadata_module", custom_metadata_module_path
+                )
+                metadata_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(metadata_module)
+                custom_metadata_fn = metadata_module.get_custom_metadata
+
+            if dataset_type == "wds":
+                webdataset_path = wds_config.get("path", None)
+                assert webdataset_path is not None, "Path must be set for local WebDataset configuration"
+
+                wds_configs.append(
+                    LocalWebDatasetConfig(
+                        id=wds_config["id"],
+                        path=webdataset_path,
+                        custom_metadata_fn=custom_metadata_fn,
+                    )
+                )
+            else:
+                s3_path = wds_config.get("s3_path", None)
+                assert s3_path is not None, "s3_path must be set for S3 WebDataset configuration"
+
+                wds_configs.append(
+                    S3DatasetConfig(
+                        id=wds_config["id"],
+                        s3_path=s3_path,
+                        custom_metadata_fn=custom_metadata_fn,
+                        profile=wds_config.get("profile", None),
+                    )
+                )
+
+        train_dl = WebDatasetDataLoader(
+            wds_configs,
+            sample_rate=sample_rate,
+            sample_size=sample_size,
+            batch_size=batch_size,
+            random_crop=dataset_config.get("random_crop", True),
+            num_workers=num_workers,
+            persistent_workers=True,
+            pin_memory=True,
+            force_channels=force_channels,
+            epoch_steps=dataset_config.get("epoch_steps", 2000),
+            pre_encoded=dataset_config.get("pre_encoded", False),
+            latent_crop_length=dataset_config.get("latent_crop_length", None),
+            latent_extension=dataset_config.get("latent_extension", "npy"),
+            min_length_sec=dataset_config.get("min_length_sec", None),
+            max_length_sec=dataset_config.get("max_length_sec", None),
+            resampled_shards=dataset_config.get("resampled_shards", True),
+        ).data_loader
+
+        return train_dl, []
 
     else:
         raise NotImplementedError
