@@ -40,6 +40,42 @@ from PIL import Image
 from time import time
 
 
+def _log_image(trainer, key, image, global_step):
+    experiment = trainer.logger.experiment
+
+    if hasattr(experiment, "add_image"):
+        experiment.add_image(key, image, global_step=global_step)
+        return
+
+    if isinstance(image, torch.Tensor):
+        image = wandb.Image(image)
+    else:
+        image = wandb.Image(image)
+
+    experiment.log({key: image, "trainer/global_step": global_step})
+
+
+def _log_audio(trainer, key, audio, sample_rate, global_step):
+    experiment = trainer.logger.experiment
+
+    if hasattr(experiment, "add_audio"):
+        experiment.add_audio(
+            key,
+            audio,
+            global_step=global_step,
+            sample_rate=sample_rate,
+        )
+        return
+
+    audio_np = audio.detach().cpu().transpose(0, 1).numpy()
+    experiment.log(
+        {
+            key: wandb.Audio(audio_np, sample_rate=sample_rate),
+            "trainer/global_step": global_step,
+        }
+    )
+
+
 class Profiler:
 
     def __init__(self):
@@ -798,16 +834,18 @@ class DiffusionCondDemoCallback(pl.Callback):
                 )  # expects int16 PCM range
                 if isinstance(spec_img, Image.Image):
                     spec_img = torchvision.transforms.ToTensor()(spec_img)
-                trainer.logger.experiment.add_audio(
+                _log_audio(
+                    trainer,
                     f"demo_audio_cond_mono",
                     audio_inputs,
-                    global_step=trainer.global_step,
-                    sample_rate=self.sample_rate,
+                    self.sample_rate,
+                    trainer.global_step,
                 )
-                trainer.logger.experiment.add_image(
+                _log_image(
+                    trainer,
                     f"demo_audio_cond_melspec_mono",
                     spec_img,
-                    global_step=trainer.global_step,
+                    trainer.global_step,
                 )
 
             for cfg_scale in self.demo_cfg_scales:
@@ -874,16 +912,18 @@ class DiffusionCondDemoCallback(pl.Callback):
                 )  # expects int16 PCM range
                 if isinstance(spec_img, Image.Image):
                     spec_img = torchvision.transforms.ToTensor()(spec_img)
-                trainer.logger.experiment.add_audio(
+                _log_audio(
+                    trainer,
                     f"demo_mono_cfg_{cfg_scale}",
                     fakes,
-                    global_step=trainer.global_step,
-                    sample_rate=self.sample_rate,
+                    self.sample_rate,
+                    trainer.global_step,
                 )
-                trainer.logger.experiment.add_image(
+                _log_image(
+                    trainer,
                     f"demo_melspec_mono_cfg_{cfg_scale}",
                     spec_img,
-                    global_step=trainer.global_step,
+                    trainer.global_step,
                 )
 
             del fakes
@@ -1533,10 +1573,11 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
                     demo_reals_image = torchvision.transforms.ToTensor()(
                         demo_reals_image
                     )
-                trainer.logger.experiment.add_image(
+                _log_image(
+                    trainer,
                     f"demo_reals_melspec_left",
                     demo_reals_image,
-                    global_step=trainer.global_step,
+                    trainer.global_step,
                 )
 
             if module.diffusion.pretransform is not None:
@@ -1578,10 +1619,11 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
                     masked_input_image
                 )
 
-            trainer.logger.experiment.add_image(
+            _log_image(
+                trainer,
                 f"demo_masked_input",
                 masked_input_image,
-                global_step=trainer.global_step,
+                trainer.global_step,
             )
 
             cond_inputs = module.diffusion.get_conditioning_inputs(conditioning)
@@ -1638,16 +1680,18 @@ class DiffusionCondInpaintDemoCallback(pl.Callback):
                     fakes = torch.mean(
                         fakes, dim=0, keepdim=True
                     )  # cast to mono [1, T] since tensorboard only supports mono
-                trainer.logger.experiment.add_audio(
+                _log_audio(
+                    trainer,
                     f"demo_mono_cfg_{cfg_scale}",
                     fakes,
-                    global_step=trainer.global_step,
-                    sample_rate=self.sample_rate,
+                    self.sample_rate,
+                    trainer.global_step,
                 )
-                trainer.logger.experiment.add_image(
+                _log_image(
+                    trainer,
                     f"demo_melspec_mono_cfg_{cfg_scale}",
                     spec_img,
-                    global_step=trainer.global_step,
+                    trainer.global_step,
                 )
 
         except Exception as e:
