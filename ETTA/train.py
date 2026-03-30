@@ -237,8 +237,9 @@ def main(args):
     args_dict.update({"dataset_config": dataset_config})
     push_wandb_config(logger, args_dict)
 
-    # print config & model on rank zero
-    if int(os.environ["RANK"]) == 0:
+    # print config & model on rank zero; support both torchrun-style envs and
+    # Lightning's own launcher before rank vars are populated.
+    if int(os.environ.get("RANK", "0")) == 0:
         print(pformat(args_dict, width=256))
         print(model)
     
