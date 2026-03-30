@@ -364,7 +364,7 @@ class AutoencoderTrainingWrapper(pl.LightningModule):
         for loss_name, loss_value in losses.items():
             log_dict[f'train/{loss_name}'] = loss_value.detach()
 
-        self.log_dict(log_dict, prog_bar=True, on_step=True)
+        self.log_dict(log_dict, prog_bar=True, on_step=True, sync_dist=True)
         
         # track histrogram of quantizer_indices to see codebook utils for VQ models
         if hasattr(self.autoencoder.bottleneck, "tokens_id") and self.autoencoder.bottleneck.tokens_id in encoder_info.keys():

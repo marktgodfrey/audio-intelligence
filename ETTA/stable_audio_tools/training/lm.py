@@ -167,7 +167,7 @@ class AudioLanguageModelTrainingWrapper(pl.LightningModule):
             log_dict[f'cross_entropy_q{k + 1}'] = ce_q
             log_dict[f'perplexity_q{k + 1}'] = torch.exp(ce_q)
 
-        self.log_dict(log_dict, prog_bar=True, on_step=True)
+        self.log_dict(log_dict, prog_bar=True, on_step=True, sync_dist=True)
         return loss
 
     def on_before_zero_grad(self, *args, **kwargs):

@@ -188,7 +188,7 @@ class DiffusionUncondTrainingWrapper(pl.LightningModule):
         for loss_name, loss_value in losses.items():
             log_dict[f"train/{loss_name}"] = loss_value.detach()
 
-        self.log_dict(log_dict, prog_bar=True, on_step=True)
+        self.log_dict(log_dict, prog_bar=True, on_step=True, sync_dist=True)
         return loss
 
     def on_before_zero_grad(self, *args, **kwargs):
@@ -527,7 +527,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
                 if not torch.isnan(loss_all[i])
             }
 
-            self.log_dict(debug_log_dict)
+            self.log_dict(debug_log_dict, sync_dist=True)
 
         log_dict = {
             "train/loss": loss.detach(),
@@ -540,7 +540,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         for loss_name, loss_value in losses.items():
             log_dict[f"train/{loss_name}"] = loss_value.detach()
 
-        self.log_dict(log_dict, prog_bar=True, on_step=True)
+        self.log_dict(log_dict, prog_bar=True, on_step=True, sync_dist=True)
         p.tick("log")
         # print(f"Profiler: {p}")
         return loss
@@ -706,7 +706,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
                 if not torch.isnan(loss_all[i])
             }
 
-            self.log_dict(debug_log_dict)
+            self.log_dict(debug_log_dict, sync_dist=True)
 
         log_dict = {
             f"valid_{dataloader_idx}/loss": loss.detach(),
@@ -1318,7 +1318,7 @@ class DiffusionCondInpaintTrainingWrapper(pl.LightningModule):
                 if not torch.isnan(loss_all[i])
             }
 
-            self.log_dict(debug_log_dict)
+            self.log_dict(debug_log_dict, sync_dist=True)
 
         log_dict = {
             "train/loss": loss.detach(),
@@ -1331,7 +1331,7 @@ class DiffusionCondInpaintTrainingWrapper(pl.LightningModule):
         for loss_name, loss_value in losses.items():
             log_dict[f"train/{loss_name}"] = loss_value.detach()
 
-        self.log_dict(log_dict, prog_bar=True, on_step=True)
+        self.log_dict(log_dict, prog_bar=True, on_step=True, sync_dist=True)
         p.tick("log")
         # print(f"Profiler: {p}")
         return loss
@@ -1481,7 +1481,7 @@ class DiffusionCondInpaintTrainingWrapper(pl.LightningModule):
                 if not torch.isnan(loss_all[i])
             }
 
-            self.log_dict(debug_log_dict)
+            self.log_dict(debug_log_dict, sync_dist=True)
 
         log_dict = {
             f"valid_{dataloader_idx}/loss": loss.detach(),
@@ -1856,7 +1856,7 @@ class DiffusionAutoencoderTrainingWrapper(pl.LightningModule):
         for loss_name, loss_value in losses.items():
             log_dict[f"train/{loss_name}"] = loss_value.detach()
 
-        self.log_dict(log_dict, prog_bar=True, on_step=True)
+        self.log_dict(log_dict, prog_bar=True, on_step=True, sync_dist=True)
         return loss
 
     def on_before_zero_grad(self, *args, **kwargs):
@@ -2222,7 +2222,7 @@ class DiffusionPriorTrainingWrapper(pl.LightningModule):
                 if not torch.isnan(loss_all[i])
             }
 
-            self.log_dict(debug_log_dict)
+            self.log_dict(debug_log_dict, sync_dist=True)
 
         log_dict = {
             "train/loss": loss.detach(),
@@ -2233,7 +2233,7 @@ class DiffusionPriorTrainingWrapper(pl.LightningModule):
         for loss_name, loss_value in losses.items():
             log_dict[f"train/{loss_name}"] = loss_value.detach()
 
-        self.log_dict(log_dict, prog_bar=True, on_step=True)
+        self.log_dict(log_dict, prog_bar=True, on_step=True, sync_dist=True)
         return loss
 
     def on_before_zero_grad(self, *args, **kwargs):
