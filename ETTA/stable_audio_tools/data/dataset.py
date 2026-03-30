@@ -1129,6 +1129,48 @@ class WebDatasetDataLoader:
 
         return sample
 
+
+def create_webdataset_configs(dataset_entries, dataset_type):
+    configs = []
+
+    for wds_config in dataset_entries:
+        custom_metadata_fn = None
+        custom_metadata_module_path = wds_config.get("custom_metadata_module", None)
+
+        if custom_metadata_module_path is not None:
+            spec = importlib.util.spec_from_file_location(
+                "metadata_module", custom_metadata_module_path
+            )
+            metadata_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(metadata_module)
+            custom_metadata_fn = metadata_module.get_custom_metadata
+
+        if dataset_type == "wds":
+            webdataset_path = wds_config.get("path", None)
+            assert webdataset_path is not None, "Path must be set for local WebDataset configuration"
+
+            configs.append(
+                LocalWebDatasetConfig(
+                    id=wds_config["id"],
+                    path=webdataset_path,
+                    custom_metadata_fn=custom_metadata_fn,
+                )
+            )
+        else:
+            s3_path = wds_config.get("s3_path", None)
+            assert s3_path is not None, "s3_path must be set for S3 WebDataset configuration"
+
+            configs.append(
+                S3DatasetConfig(
+                    id=wds_config["id"],
+                    s3_path=s3_path,
+                    custom_metadata_fn=custom_metadata_fn,
+                    profile=wds_config.get("profile", None),
+                )
+            )
+
+    return configs
+
 def group_by_keys(
     data, keys=wds.tariterators.base_plus_ext, lcase=True, suffixes=None, handler=None
 ):
@@ -1528,44 +1570,10 @@ def create_dataloader_from_config(
         return train_dl, list_valid_dl
 
     elif dataset_type in ["wds", "s3"]:
+        train_dataset_entries = dataset_config.get("datasets", None)
+        assert train_dataset_entries is not None, "WebDataset configuration must be specified in datasets"
 
-        wds_configs = []
-
-        for wds_config in dataset_config["datasets"]:
-            custom_metadata_fn = None
-            custom_metadata_module_path = wds_config.get("custom_metadata_module", None)
-
-            if custom_metadata_module_path is not None:
-                spec = importlib.util.spec_from_file_location(
-                    "metadata_module", custom_metadata_module_path
-                )
-                metadata_module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(metadata_module)
-                custom_metadata_fn = metadata_module.get_custom_metadata
-
-            if dataset_type == "wds":
-                webdataset_path = wds_config.get("path", None)
-                assert webdataset_path is not None, "Path must be set for local WebDataset configuration"
-
-                wds_configs.append(
-                    LocalWebDatasetConfig(
-                        id=wds_config["id"],
-                        path=webdataset_path,
-                        custom_metadata_fn=custom_metadata_fn,
-                    )
-                )
-            else:
-                s3_path = wds_config.get("s3_path", None)
-                assert s3_path is not None, "s3_path must be set for S3 WebDataset configuration"
-
-                wds_configs.append(
-                    S3DatasetConfig(
-                        id=wds_config["id"],
-                        s3_path=s3_path,
-                        custom_metadata_fn=custom_metadata_fn,
-                        profile=wds_config.get("profile", None),
-                    )
-                )
+        wds_configs = create_webdataset_configs(train_dataset_entries, dataset_type)
 
         train_dl = WebDatasetDataLoader(
             wds_configs,
@@ -1586,7 +1594,37 @@ def create_dataloader_from_config(
             resampled_shards=dataset_config.get("resampled_shards", True),
         ).data_loader
 
-        return train_dl, []
+        datasets_valid = dataset_config.get("datasets_valid", None)
+        list_valid_dl = []
+
+        if datasets_valid is not None:
+            if len(datasets_valid) > 0 and isinstance(datasets_valid[0], dict):
+                datasets_valid = [datasets_valid]
+
+            for dataset_valid_group in datasets_valid:
+                valid_configs = create_webdataset_configs(dataset_valid_group, dataset_type)
+                valid_dl = WebDatasetDataLoader(
+                    valid_configs,
+                    sample_rate=sample_rate,
+                    sample_size=sample_size,
+                    batch_size=batch_size,
+                    random_crop=dataset_config.get("random_crop_valid", False),
+                    num_workers=num_workers,
+                    persistent_workers=True,
+                    pin_memory=True,
+                    force_channels=force_channels,
+                    epoch_steps=dataset_config.get("epoch_steps_valid", dataset_config.get("epoch_steps", 2000)),
+                    pre_encoded=dataset_config.get("pre_encoded", False),
+                    latent_crop_length=dataset_config.get("latent_crop_length", None),
+                    latent_extension=dataset_config.get("latent_extension", "npy"),
+                    min_length_sec=dataset_config.get("min_length_sec", None),
+                    max_length_sec=dataset_config.get("max_length_sec", None),
+                    resampled_shards=dataset_config.get("resampled_shards_valid", False),
+                    drop_last=False,
+                ).data_loader
+                list_valid_dl.append(valid_dl)
+
+        return train_dl, list_valid_dl
 
     else:
         raise NotImplementedError
