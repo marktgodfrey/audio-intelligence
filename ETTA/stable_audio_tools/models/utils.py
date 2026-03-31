@@ -4,6 +4,7 @@
 
 import torch
 from safetensors.torch import load_file
+from pathlib import Path
 
 from torch.nn.utils import remove_weight_norm
 from torch.nn.utils.parametrize import remove_parametrizations
@@ -23,7 +24,7 @@ def load_torch_checkpoint(ckpt_path, map_location="cpu", weights_only=False):
 
 
 def patch_lightning_checkpoint_loading():
-    """Force trusted ETTA Lightning checkpoints to load with full pickle semantics."""
+    """Force trusted ETTA Lightning checkpoints to load on CPU with full pickle semantics."""
     try:
         from lightning_fabric.plugins.io.torch_io import TorchCheckpointIO
     except ImportError:
@@ -36,10 +37,36 @@ def patch_lightning_checkpoint_loading():
 
     def load_checkpoint(self, path, map_location=None, weights_only=False):
         allow_etta_checkpoint_globals()
-        return original_load_checkpoint(self, path, map_location=map_location, weights_only=False)
+        return original_load_checkpoint(self, path, map_location="cpu", weights_only=False)
 
     load_checkpoint._etta_patched = True
     TorchCheckpointIO.load_checkpoint = load_checkpoint
+
+
+def patch_torch_load_for_etta_checkpoints():
+    """Force trusted ETTA checkpoints to deserialize on CPU with full pickle semantics."""
+    if getattr(torch.load, "_etta_patched", False):
+        return
+
+    original_torch_load = torch.load
+
+    def _is_etta_checkpoint_path(f):
+        if isinstance(f, (str, Path)):
+            path = str(f)
+            return path.endswith(".ckpt") or path.endswith(".pt")
+        return False
+
+    def patched_torch_load(f, *args, **kwargs):
+        allow_etta_checkpoint_globals()
+        if _is_etta_checkpoint_path(f):
+            if kwargs.get("map_location") is None:
+                kwargs["map_location"] = "cpu"
+        if kwargs.get("weights_only") is True and _is_etta_checkpoint_path(f):
+            kwargs["weights_only"] = False
+        return original_torch_load(f, *args, **kwargs)
+
+    patched_torch_load._etta_patched = True
+    torch.load = patched_torch_load
 
 def load_ckpt_state_dict(ckpt_path):
     if ckpt_path.endswith(".safetensors"):

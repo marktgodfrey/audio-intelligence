@@ -7,13 +7,14 @@ import json
 import torch
 from torch.nn.parameter import Parameter
 from stable_audio_tools.models import create_model_from_config
-from stable_audio_tools.models.utils import allow_etta_checkpoint_globals, patch_lightning_checkpoint_loading, remove_weight_norm_from_model
+from stable_audio_tools.models.utils import allow_etta_checkpoint_globals, patch_lightning_checkpoint_loading, patch_torch_load_for_etta_checkpoints, remove_weight_norm_from_model
 from stable_audio_tools.utils.addict import Dict as AttrDict
 from pprint import pprint
 
 if __name__ == '__main__':
     allow_etta_checkpoint_globals()
     patch_lightning_checkpoint_loading()
+    patch_torch_load_for_etta_checkpoints()
 
     args = argparse.ArgumentParser()
     args.add_argument('--model-config', type=str, default=None)

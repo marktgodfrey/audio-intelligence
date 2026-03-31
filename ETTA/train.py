@@ -17,6 +17,7 @@ from stable_audio_tools.models.utils import (
     allow_etta_checkpoint_globals,
     load_ckpt_state_dict,
     patch_lightning_checkpoint_loading,
+    patch_torch_load_for_etta_checkpoints,
     remove_weight_norm_from_model,
 )
 from stable_audio_tools.training import create_training_wrapper_from_config, create_demo_callback_from_config
@@ -86,6 +87,7 @@ class ModelConfigEmbedderCallback(pl.Callback):
 def main(args):
     allow_etta_checkpoint_globals()
     patch_lightning_checkpoint_loading()
+    patch_torch_load_for_etta_checkpoints()
 
     seed = args.seed
     
