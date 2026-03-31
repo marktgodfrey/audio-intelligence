@@ -7,11 +7,13 @@ import json
 import torch
 from torch.nn.parameter import Parameter
 from stable_audio_tools.models import create_model_from_config
-from stable_audio_tools.models.utils import remove_weight_norm_from_model
+from stable_audio_tools.models.utils import allow_etta_checkpoint_globals, remove_weight_norm_from_model
 from stable_audio_tools.utils.addict import Dict as AttrDict
 from pprint import pprint
 
 if __name__ == '__main__':
+    allow_etta_checkpoint_globals()
+
     args = argparse.ArgumentParser()
     args.add_argument('--model-config', type=str, default=None)
     args.add_argument('--ckpt-path', type=str, default=None)

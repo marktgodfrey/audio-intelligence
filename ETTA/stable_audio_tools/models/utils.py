@@ -7,12 +7,25 @@ from safetensors.torch import load_file
 
 from torch.nn.utils import remove_weight_norm
 from torch.nn.utils.parametrize import remove_parametrizations
+from stable_audio_tools.utils.addict import Dict as AttrDict
+
+
+def allow_etta_checkpoint_globals():
+    """Allow ETTA's serialized config wrapper when PyTorch uses weights_only loading."""
+    add_safe_globals = getattr(torch.serialization, "add_safe_globals", None)
+    if add_safe_globals is not None:
+        add_safe_globals([AttrDict])
+
+
+def load_torch_checkpoint(ckpt_path, map_location="cpu", weights_only=False):
+    allow_etta_checkpoint_globals()
+    return torch.load(ckpt_path, map_location=map_location, weights_only=weights_only)
 
 def load_ckpt_state_dict(ckpt_path):
     if ckpt_path.endswith(".safetensors"):
         state_dict = load_file(ckpt_path)
     else:
-        state_dict = torch.load(ckpt_path, map_location="cpu")["state_dict"]
+        state_dict = load_torch_checkpoint(ckpt_path, map_location="cpu", weights_only=False)["state_dict"]
     
     return state_dict
 

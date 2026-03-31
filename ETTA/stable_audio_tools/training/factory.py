@@ -5,6 +5,7 @@
 import torch
 from torch.nn import Parameter
 from ..models.factory import create_model_from_config
+from ..models.utils import load_torch_checkpoint
 
 def create_training_wrapper_from_config(model_config, model):
     model_type = model_config.get('model_type', None)
@@ -39,7 +40,7 @@ def create_training_wrapper_from_config(model_config, model):
 
             teacher_model_ckpt = training_config.get("teacher_model_ckpt", None)
             if teacher_model_ckpt is not None:
-                teacher_model.load_state_dict(torch.load(teacher_model_ckpt)["state_dict"])
+                teacher_model.load_state_dict(load_torch_checkpoint(teacher_model_ckpt, weights_only=False)["state_dict"])
             else:
                 raise ValueError("teacher_model_ckpt must be specified if teacher_model is specified")
 
