@@ -1180,8 +1180,17 @@ def group_by_keys(
     """
     current_sample = None
     for filesample in data:
-        assert isinstance(filesample, dict)
-        fname, value = filesample["fname"], filesample["data"]
+        if not isinstance(filesample, dict):
+            continue
+
+        fname = filesample.get("fname", None)
+        value = filesample.get("data", None)
+
+        # WebDataset can emit control/error records that are not actual tar members.
+        # Skip them rather than crashing worker processes.
+        if fname is None or value is None:
+            continue
+
         prefix, suffix = keys(fname)
         if wds.tariterators.trace:
             print(
@@ -1196,7 +1205,10 @@ def group_by_keys(
         if current_sample is None or prefix != current_sample["__key__"]:
             if wds.tariterators.valid_sample(current_sample):
                 yield current_sample
-            current_sample = dict(__key__=prefix, __url__=filesample["__url__"])
+            current_sample = dict(
+                __key__=prefix,
+                __url__=filesample.get("__url__", ""),
+            )
         if suffix in current_sample:
             print(
                 f"{fname}: duplicate file name in tar file {suffix} {current_sample.keys()}"
