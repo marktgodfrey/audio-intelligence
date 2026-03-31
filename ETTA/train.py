@@ -13,7 +13,12 @@ from prefigure.prefigure import push_wandb_config
 
 from stable_audio_tools.data.dataset import create_dataloader_from_config
 from stable_audio_tools.models import create_model_from_config
-from stable_audio_tools.models.utils import allow_etta_checkpoint_globals, load_ckpt_state_dict, remove_weight_norm_from_model
+from stable_audio_tools.models.utils import (
+    allow_etta_checkpoint_globals,
+    load_ckpt_state_dict,
+    patch_lightning_checkpoint_loading,
+    remove_weight_norm_from_model,
+)
 from stable_audio_tools.training import create_training_wrapper_from_config, create_demo_callback_from_config
 from stable_audio_tools.training.utils import copy_state_dict
 
@@ -80,6 +85,7 @@ class ModelConfigEmbedderCallback(pl.Callback):
 
 def main(args):
     allow_etta_checkpoint_globals()
+    patch_lightning_checkpoint_loading()
 
     seed = args.seed
     

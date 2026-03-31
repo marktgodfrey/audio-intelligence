@@ -21,6 +21,26 @@ def load_torch_checkpoint(ckpt_path, map_location="cpu", weights_only=False):
     allow_etta_checkpoint_globals()
     return torch.load(ckpt_path, map_location=map_location, weights_only=weights_only)
 
+
+def patch_lightning_checkpoint_loading():
+    """Force trusted ETTA Lightning checkpoints to load with full pickle semantics."""
+    try:
+        from lightning_fabric.plugins.io.torch_io import TorchCheckpointIO
+    except ImportError:
+        return
+
+    if getattr(TorchCheckpointIO.load_checkpoint, "_etta_patched", False):
+        return
+
+    original_load_checkpoint = TorchCheckpointIO.load_checkpoint
+
+    def load_checkpoint(self, path, map_location=None, weights_only=False):
+        allow_etta_checkpoint_globals()
+        return original_load_checkpoint(self, path, map_location=map_location, weights_only=False)
+
+    load_checkpoint._etta_patched = True
+    TorchCheckpointIO.load_checkpoint = load_checkpoint
+
 def load_ckpt_state_dict(ckpt_path):
     if ckpt_path.endswith(".safetensors"):
         state_dict = load_file(ckpt_path)
