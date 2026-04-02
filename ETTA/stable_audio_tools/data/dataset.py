@@ -244,27 +244,33 @@ def get_audio_filenames(
     return filenames, num_files_per_dir
 
 
-def get_latent_filenames(
-    paths: list,
-    extensions=["npy"],
-):
-    "recursively get a list of pre-encoded filenames"
+def get_latent_filenames(paths: list, extensions=["npy"]):
+    """recursively get a list of pre-encoded filenames"""
     filenames = []
 
     if type(paths) is str:
         paths = [paths]
 
+    # normalize extensions to include leading dot
+    extensions = [
+        "." + ext.lower().lstrip(".")
+        for ext in extensions
+    ]
+
     for path in paths:
         filelist_path = os.path.join(path, "filelist.txt")
-
         if os.path.exists(filelist_path):
             with open(filelist_path, "r") as f:
                 files = [os.path.join(path, file.strip()) for file in f.readlines()]
-                filenames.extend(files)
+            filenames.extend(files)
             continue
 
-        _, files = fast_scandir(0, path, extensions)
-        filenames.extend(files)
+        for root, _, files in os.walk(path):
+            for fname in files:
+                if fname.startswith(".") or fname.startswith("._"):
+                    continue
+                if os.path.splitext(fname)[1].lower() in extensions:
+                    filenames.append(os.path.join(root, fname))
 
     return filenames
 
