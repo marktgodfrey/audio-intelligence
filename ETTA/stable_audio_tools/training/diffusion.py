@@ -885,16 +885,9 @@ class DiffusionCondDemoCallback(pl.Callback):
                 fakes = (
                     fakes.float()
                 )  # cast to float to ensure nothing goes wrong during formatting
-                # Trim each generated sample in "fakes" to match "seconds_total" for better demo
-                # note that this loses any audio generated after "seconds_total"
-                trimmed_fakes = []
-                for fake, cond in zip(fakes, demo_cond):
-                    total_samples = cond["seconds_total"] * self.sample_rate
-                    trimmed_length = min(fake.shape[1], total_samples)
-                    trimmed_fakes.append(fake[:, :trimmed_length])
 
-                # Stack the trimmed fakes back into a tensor
-                fakes = torch.stack(trimmed_fakes)
+                # Skip demo trimming when conditioning metadata may be collated into
+                # nested structures; keeping full-length demos avoids callback crashes.
 
                 # Put the demos together
                 fakes = rearrange(fakes, "b d n -> d (b n)")
