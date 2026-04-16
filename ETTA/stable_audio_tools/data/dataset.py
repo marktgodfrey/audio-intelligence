@@ -42,6 +42,10 @@ def audio_decoder(key, value):
 
 
 def collation_fn(samples):
+    samples = [sample for sample in samples if sample is not None]
+    if not samples:
+        return None
+
     batched = list(zip(*samples))
     result = []
     for b in batched:
@@ -917,11 +921,13 @@ def is_valid_sample(sample):
     if sample is None or not isinstance(sample, dict):
         return False
 
-    has_json = "json" in sample
-    has_audio = "audio" in sample
+    json_data = sample.get("json")
+    audio_data = sample.get("audio")
+    has_json = isinstance(json_data, dict)
+    has_audio = audio_data is not None
     is_pre_encoded = sample.get("__pre_encoded__", False)
-    is_silent = has_audio and (not is_pre_encoded) and is_silence(sample["audio"])
-    is_rejected = has_json and "__reject__" in sample["json"] and sample["json"]["__reject__"]
+    is_silent = has_audio and (not is_pre_encoded) and is_silence(audio_data)
+    is_rejected = has_json and json_data.get("__reject__", False)
 
     return has_json and has_audio and not is_silent and not is_rejected
 
@@ -997,6 +1003,7 @@ class WebDatasetDataLoader:
 
         self.data_loader = wds.WebLoader(
             self.dataset,
+            batch_size=None,
             num_workers=num_workers,
             worker_init_fn=worker_init_fn,
             **data_loader_kwargs,
@@ -1055,6 +1062,10 @@ class WebDatasetDataLoader:
         return latents, info
 
     def wds_preprocess(self, sample):
+        metadata = sample.get("json")
+        if not isinstance(metadata, dict):
+            return None
+
         if self.pre_encoded:
             audio = None
             found_key = self.latent_extension
@@ -1095,9 +1106,9 @@ class WebDatasetDataLoader:
                     sample_rate=self.sample_rate,
                 )
                 audio, t_start, t_end, seconds_start, seconds_total, padding_mask = pad_crop(audio)
-                sample["json"]["seconds_start"] = seconds_start
-                sample["json"]["seconds_total"] = seconds_total
-                sample["json"]["padding_mask"] = padding_mask
+                metadata["seconds_start"] = seconds_start
+                metadata["seconds_total"] = seconds_total
+                metadata["padding_mask"] = padding_mask
             else:
                 t_start, t_end = 0, 1
 
@@ -1110,11 +1121,11 @@ class WebDatasetDataLoader:
                 PhaseFlipper() if self.augment_phase else torch.nn.Identity(),
             )
             audio = augs(audio)
-            sample["json"]["timestamps"] = (t_start, t_end)
-            sample["json"]["audio"] = audio
+            metadata["timestamps"] = (t_start, t_end)
+            metadata["audio"] = audio
 
-        if "text" in sample["json"]:
-            sample["json"]["prompt"] = sample["json"]["text"]
+        if "text" in metadata:
+            metadata["prompt"] = metadata["text"]
 
         matched_dataset = None
         for dataset in self.datasets:
@@ -1126,31 +1137,33 @@ class WebDatasetDataLoader:
             if self.pre_encoded:
                 audio, info = self._apply_pre_encoded_rules(
                     audio,
-                    sample["json"],
+                    metadata,
                     sample["__key__"],
                     dataset.custom_metadata_fn,
                 )
+                metadata = info
                 sample["json"] = info
                 break
             elif dataset.custom_metadata_fn is not None:
-                custom_metadata = dataset.custom_metadata_fn(sample["json"], audio)
-                sample["json"].update(custom_metadata)
+                custom_metadata = dataset.custom_metadata_fn(metadata, audio)
+                metadata.update(custom_metadata)
 
         if self.pre_encoded and matched_dataset is None:
             audio, info = self._apply_pre_encoded_rules(
                 audio,
-                sample["json"],
+                metadata,
                 sample["__key__"],
                 None,
             )
+            metadata = info
             sample["json"] = info
 
-        if not has_valid_prompt(sample["json"]):
-            sample["json"]["__reject__"] = True
-            sample["json"]["__reject_reason__"] = "missing_prompt"
+        if not has_valid_prompt(metadata):
+            metadata["__reject__"] = True
+            metadata["__reject_reason__"] = "missing_prompt"
 
         sample["audio"] = audio
-        sample["json"]["audio"] = audio
+        metadata["audio"] = audio
 
         return sample
 
