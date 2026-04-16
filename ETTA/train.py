@@ -3,6 +3,7 @@
 # modified from stable-audio-tools under the MIT license
 
 import argparse
+import copy
 import json
 import os, sys
 import torch
@@ -68,13 +69,41 @@ class EarlyStoppingCallback(pl.callbacks.EarlyStopping):
         self, trainer: "pl.Trainer"
     ) -> None:
         """Terminates the training process with a non-zero return code to signal an error."""
-        print(f"[ERROR] Training force-stopped due to early stopping criteria being met. Usually it means nan/inf training loss is detected.")
+        current_value = None
+        try:
+            logs = trainer.callback_metrics
+            if self.monitor in logs:
+                current_value = logs[self.monitor]
+                if torch.is_tensor(current_value):
+                    current_value = current_value.detach().float().cpu()
+                    if current_value.numel() == 1:
+                        current_value = current_value.item()
+                    else:
+                        current_value = current_value.tolist()
+        except Exception as exc:
+            current_value = f"<unavailable: {exc!r}>"
+
+        rank = getattr(trainer, "global_rank", None)
+        print(
+            f"[ERROR][rank={rank}] Training force-stopped due to early stopping criteria being met. "
+            f"Usually it means nan/inf training loss is detected. "
+            f"monitor={self.monitor} value={current_value}",
+            flush=True,
+        )
+        debug_payload = getattr(trainer.lightning_module, "_last_nonfinite_debug", None)
+        if debug_payload:
+            print("[ERROR] Last recorded batch debug follows:", flush=True)
+            print(debug_payload, flush=True)
         sys.exit(1)  # Terminate the process with a non-zero return code to signal an error
         
 
 class ExceptionCallback(pl.Callback):
     def on_exception(self, trainer, module, err):
-        print(f'{type(err).__name__}: {err}')
+        print(f'{type(err).__name__}: {err}', flush=True)
+        debug_payload = getattr(module, "_last_nonfinite_debug", None)
+        if debug_payload:
+            print("[ERROR] Last recorded batch debug follows:", flush=True)
+            print(debug_payload, flush=True)
         
         
 class ModelConfigEmbedderCallback(pl.Callback):
@@ -178,6 +207,8 @@ def main(args):
         copy_state_dict(model, load_ckpt_state_dict(args.pretrained_ckpt_path))
 
     training_wrapper = create_training_wrapper_from_config(model_config, model)
+    if args.ckpt_path:
+        training_wrapper.strict_loading = False
     
     # load wrapped ckpt for 2nd-stage training exps: swapping out quantizers from pretrained model & discrimiantor...
     # This still resets the optimizers
@@ -245,7 +276,22 @@ def main(args):
     args_dict = vars(args)
     args_dict.update({"model_config": model_config})
     args_dict.update({"dataset_config": dataset_config})
-    push_wandb_config(logger, args_dict)
+
+    wandb_args_dict = dict(args_dict)
+    if os.environ.get("WANDB_RUN_ID") and os.environ.get("WANDB_RESUME") and args.ckpt_path:
+        wandb_args_dict["resume_ckpt_path"] = args.ckpt_path
+        wandb_args_dict["ckpt_path"] = ""
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(
+                "[INFO] W&B resume detected; preserving original ckpt_path config and "
+                f"recording resume_ckpt_path={args.ckpt_path}"
+            )
+
+    if os.environ.get("WANDB_RUN_ID") and os.environ.get("WANDB_RESUME"):
+        if hasattr(logger.experiment.config, "update"):
+            logger.experiment.config.update(copy.deepcopy(wandb_args_dict), allow_val_change=True)
+    else:
+        push_wandb_config(logger, wandb_args_dict)
 
     # print config & model on rank zero; support both torchrun-style envs and
     # Lightning's own launcher before rank vars are populated.
