@@ -926,6 +926,21 @@ def is_valid_sample(sample):
     return has_json and has_audio and not is_silent and not is_rejected
 
 
+def has_valid_prompt(metadata):
+    if "prompt" not in metadata:
+        return False
+
+    prompt = metadata["prompt"]
+
+    if prompt is None:
+        return False
+
+    if isinstance(prompt, str):
+        return bool(prompt.strip())
+
+    return True
+
+
 class WebDatasetDataLoader:
     def __init__(
         self,
@@ -1129,6 +1144,10 @@ class WebDatasetDataLoader:
                 None,
             )
             sample["json"] = info
+
+        if not has_valid_prompt(sample["json"]):
+            sample["json"]["__reject__"] = True
+            sample["json"]["__reject_reason__"] = "missing_prompt"
 
         sample["audio"] = audio
         sample["json"]["audio"] = audio
