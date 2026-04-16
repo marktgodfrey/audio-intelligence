@@ -37,6 +37,7 @@ from .utils import (
 
 import torchvision
 from PIL import Image
+from pprint import pformat
 from time import time
 
 
@@ -353,6 +354,165 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         self.optimizer_configs = optimizer_configs
 
         self.pre_encoded = pre_encoded
+        self._last_nonfinite_debug = None
+
+    def _debug_rank(self):
+        rank = getattr(self, "global_rank", None)
+        if rank is None and torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        return int(rank) if rank is not None else 0
+
+    def _debug_scalar(self, value):
+        if torch.is_tensor(value):
+            detached = value.detach()
+            if detached.numel() == 1:
+                return float(detached.float().cpu().item())
+            return {
+                "shape": tuple(int(x) for x in detached.shape),
+                "dtype": str(detached.dtype),
+            }
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return repr(value)
+
+    def _tensor_debug_stats(self, tensor):
+        if tensor is None:
+            return None
+
+        detached = tensor.detach()
+        stats = {
+            "shape": tuple(int(x) for x in detached.shape),
+            "dtype": str(detached.dtype),
+            "device": str(detached.device),
+        }
+
+        try:
+            finite = torch.isfinite(detached)
+            stats["all_finite"] = bool(finite.all().item())
+            stats["nan_count"] = int(torch.isnan(detached).sum().item())
+            stats["inf_count"] = int(torch.isinf(detached).sum().item())
+            finite_count = int(finite.sum().item())
+            stats["finite_count"] = finite_count
+
+            if finite_count > 0:
+                finite_values = detached[finite].float()
+                stats["min"] = float(finite_values.min().item())
+                stats["max"] = float(finite_values.max().item())
+                stats["mean"] = float(finite_values.mean().item())
+                stats["std"] = (
+                    float(finite_values.std(unbiased=False).item())
+                    if finite_values.numel() > 1
+                    else 0.0
+                )
+        except Exception as exc:
+            stats["stats_error"] = repr(exc)
+
+        return stats
+
+    def _summarize_conditioning(self, value):
+        if torch.is_tensor(value):
+            return self._tensor_debug_stats(value)
+        if isinstance(value, dict):
+            return {str(key): self._summarize_conditioning(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._summarize_conditioning(item) for item in value]
+        return self._debug_scalar(value)
+
+    def _summarize_metadata(self, metadata, limit=4):
+        sample_summaries = []
+
+        for md in metadata[:limit]:
+            if not isinstance(md, dict):
+                sample_summaries.append(
+                    {
+                        "type": type(md).__name__,
+                        "value": repr(md)[:500],
+                    }
+                )
+                continue
+
+            summary = {}
+            for key in (
+                "path",
+                "relpath",
+                "chunk_idx",
+                "num_chunks",
+                "seconds_start",
+                "seconds_total",
+                "tempo",
+                "primary_genre_hint_id",
+                "normalized_track_position",
+            ):
+                if key in md:
+                    summary[key] = self._debug_scalar(md.get(key))
+
+            prompt = md.get("prompt")
+            if isinstance(prompt, str):
+                summary["prompt_len"] = len(prompt)
+                summary["prompt_preview"] = prompt[:160]
+            elif prompt is not None:
+                summary["prompt_type"] = type(prompt).__name__
+
+            padding_mask = md.get("padding_mask")
+            if torch.is_tensor(padding_mask):
+                summary["padding_mask"] = self._tensor_debug_stats(padding_mask)
+            elif isinstance(padding_mask, (list, tuple)) and padding_mask and torch.is_tensor(padding_mask[0]):
+                summary["padding_mask"] = self._tensor_debug_stats(padding_mask[0])
+
+            manifest_row = md.get("manifest_row")
+            if isinstance(manifest_row, dict):
+                summary["manifest_track_name"] = manifest_row.get("track_name")
+                summary["manifest_artist"] = manifest_row.get("primary_artist_name")
+                summary["manifest_tempo"] = self._debug_scalar(manifest_row.get("tempo"))
+                summary["manifest_primary_genre_hint_id"] = self._debug_scalar(
+                    manifest_row.get("primary_genre_hint_id")
+                )
+                summary["manifest_normalized_track_position"] = self._debug_scalar(
+                    manifest_row.get("normalized_track_position")
+                )
+
+            sample_summaries.append(summary)
+
+        return sample_summaries
+
+    def _record_batch_debug(
+        self,
+        *,
+        batch_idx,
+        metadata,
+        diffusion_input=None,
+        t=None,
+        noised_inputs=None,
+        targets=None,
+        output=None,
+        loss=None,
+        conditioning=None,
+        extra_args=None,
+        losses=None,
+        note=None,
+    ):
+        payload = {
+            "rank": self._debug_rank(),
+            "global_step": int(self.global_step),
+            "batch_idx": int(batch_idx),
+            "note": note,
+            "metadata_examples": self._summarize_metadata(metadata),
+            "diffusion_input": self._tensor_debug_stats(diffusion_input),
+            "timesteps": self._tensor_debug_stats(t),
+            "noised_inputs": self._tensor_debug_stats(noised_inputs),
+            "targets": self._tensor_debug_stats(targets),
+            "output": self._tensor_debug_stats(output),
+            "loss": self._debug_scalar(loss),
+            "conditioning": self._summarize_conditioning(conditioning) if conditioning is not None else None,
+            "extra_args": self._summarize_conditioning(extra_args or {}),
+            "named_losses": {
+                name: self._debug_scalar(value) for name, value in (losses or {}).items()
+            },
+        }
+        self._last_nonfinite_debug = pformat(payload, width=120, sort_dicts=False)
+        print("[NONFINITE DEBUG] begin", flush=True)
+        print(self._last_nonfinite_debug, flush=True)
+        print("[NONFINITE DEBUG] end", flush=True)
 
     def configure_optimizers(self):
         diffusion_opt_config = self.optimizer_configs["diffusion"]
@@ -371,6 +531,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         reals, metadata = batch
+        self._last_nonfinite_debug = None
 
         p = Profiler()
 
@@ -387,7 +548,16 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         p.tick("setup")
 
         # with torch.amp.autocast('cuda'):
-        conditioning = self.diffusion.conditioner(metadata, self.device)
+        try:
+            conditioning = self.diffusion.conditioner(metadata, self.device)
+        except Exception as exc:
+            self._record_batch_debug(
+                batch_idx=batch_idx,
+                metadata=metadata,
+                diffusion_input=diffusion_input,
+                note=f"conditioning_exception: {type(exc).__name__}: {exc}",
+            )
+            raise
 
         # If mask_padding is on, randomly drop the padding masks to allow for learning silence padding
         use_padding_mask = (
@@ -496,6 +666,21 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         )
 
         loss, losses = self.losses(loss_info)
+        if not torch.isfinite(loss):
+            self._record_batch_debug(
+                batch_idx=batch_idx,
+                metadata=metadata,
+                diffusion_input=diffusion_input,
+                t=t,
+                noised_inputs=noised_inputs,
+                targets=targets,
+                output=output,
+                loss=loss,
+                conditioning=conditioning,
+                extra_args=extra_args,
+                losses=losses,
+                note="non_finite_train_loss",
+            )
 
         p.tick("loss")
 
