@@ -9,7 +9,9 @@ import os
 import posixpath
 import random
 import re
+import shlex
 import subprocess
+import sys
 import time
 import torch
 import torchaudio
@@ -29,6 +31,98 @@ from .utils import Stereo, Mono, PhaseFlipper, PadCrop_Normalized_T
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
 
 AUDIO_KEYS = ("flac", "wav", "mp3", "m4a", "ogg", "opus")
+DEFAULT_S3_STREAMING_CONFIG = {
+    "cli_connect_timeout_sec": 30,
+    "cli_read_timeout_sec": 120,
+    "ls_timeout_sec": 300,
+    "stream_timeout_sec": 900,
+    "stream_idle_timeout_sec": 300,
+    "max_attempts": 3,
+    "retry_mode": "standard",
+}
+
+
+def normalize_s3_streaming_config(overrides=None):
+    config = dict(DEFAULT_S3_STREAMING_CONFIG)
+
+    if overrides:
+        config.update({key: value for key, value in overrides.items() if value is not None})
+
+    for key in (
+        "cli_connect_timeout_sec",
+        "cli_read_timeout_sec",
+        "ls_timeout_sec",
+        "stream_timeout_sec",
+        "stream_idle_timeout_sec",
+        "max_attempts",
+    ):
+        try:
+            config[key] = int(config[key])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"s3_streaming.{key} must be an integer") from exc
+
+        if config[key] <= 0:
+            raise ValueError(f"s3_streaming.{key} must be greater than 0")
+
+    retry_mode = str(config["retry_mode"]).strip()
+    if not retry_mode:
+        raise ValueError("s3_streaming.retry_mode must be a non-empty string")
+
+    config["retry_mode"] = retry_mode
+    return config
+
+
+def build_aws_cli_base_cmd(s3_streaming_config, profile=None):
+    config = normalize_s3_streaming_config(s3_streaming_config)
+    cmd = [
+        "aws",
+        "--cli-connect-timeout",
+        str(config["cli_connect_timeout_sec"]),
+        "--cli-read-timeout",
+        str(config["cli_read_timeout_sec"]),
+    ]
+
+    if profile is not None:
+        cmd.extend(["--profile", profile])
+
+    return cmd
+
+
+def build_aws_cli_env(s3_streaming_config):
+    config = normalize_s3_streaming_config(s3_streaming_config)
+    env = os.environ.copy()
+    env["AWS_MAX_ATTEMPTS"] = str(config["max_attempts"])
+    env["AWS_RETRY_MODE"] = config["retry_mode"]
+    return env
+
+
+def build_s3_pipe_request(s3_path, profile=None, s3_streaming_config=None):
+    config = normalize_s3_streaming_config(s3_streaming_config)
+    s3_pipe_script = Path(__file__).with_name("s3_pipe.py")
+
+    cmd = [
+        shlex.quote(sys.executable),
+        shlex.quote(str(s3_pipe_script)),
+        "--s3-path",
+        shlex.quote(s3_path),
+        "--cli-connect-timeout-sec",
+        str(config["cli_connect_timeout_sec"]),
+        "--cli-read-timeout-sec",
+        str(config["cli_read_timeout_sec"]),
+        "--stream-timeout-sec",
+        str(config["stream_timeout_sec"]),
+        "--stream-idle-timeout-sec",
+        str(config["stream_idle_timeout_sec"]),
+        "--max-attempts",
+        str(config["max_attempts"]),
+        "--retry-mode",
+        shlex.quote(config["retry_mode"]),
+    ]
+
+    if profile is not None:
+        cmd.extend(["--profile", shlex.quote(profile)])
+
+    return f"pipe:{' '.join(cmd)}"
 
 
 def audio_decoder(key, value):
@@ -321,11 +415,13 @@ class S3DatasetConfig:
         s3_path: str,
         custom_metadata_fn: Optional[Callable[[str], str]] = None,
         profile: Optional[str] = None,
+        s3_streaming_config: Optional[dict] = None,
     ):
         self.id = id
         self.path = s3_path
         self.custom_metadata_fn = custom_metadata_fn
         self.profile = profile
+        self.s3_streaming_config = normalize_s3_streaming_config(s3_streaming_config)
         self.urls = []
 
     def load_data_urls(self):
@@ -334,6 +430,7 @@ class S3DatasetConfig:
             s3_url_prefix=None,
             recursive=True,
             profiles={self.path: self.profile} if self.profile else {},
+            s3_streaming_configs={self.path: self.s3_streaming_config},
         )
         return self.urls
 
@@ -811,23 +908,30 @@ def get_s3_contents(
     recursive=True,
     debug=False,
     profile=None,
+    s3_streaming_config=None,
 ):
     """
     Returns a list of full S3 paths to files in a given S3 bucket and directory path.
     """
+    s3_streaming_config = normalize_s3_streaming_config(s3_streaming_config)
+
     if dataset_path != "" and not dataset_path.endswith("/"):
         dataset_path += "/"
 
     bucket_path = posixpath.join(s3_url_prefix or "", dataset_path)
-    cmd = ["aws", "s3", "ls", bucket_path]
-
-    if profile is not None:
-        cmd.extend(["--profile", profile])
+    cmd = build_aws_cli_base_cmd(s3_streaming_config, profile=profile)
+    cmd.extend(["s3", "ls", bucket_path])
 
     if recursive:
         cmd.append("--recursive")
 
-    run_ls = subprocess.run(cmd, capture_output=True, check=True)
+    run_ls = subprocess.run(
+        cmd,
+        capture_output=True,
+        check=True,
+        timeout=s3_streaming_config["ls_timeout_sec"],
+        env=build_aws_cli_env(s3_streaming_config),
+    )
     contents = run_ls.stdout.decode("utf-8").split("\n")
     contents = [x.strip() for x in contents if x]
     contents = [
@@ -854,15 +958,20 @@ def get_s3_contents(
 
 
 def get_all_s3_urls(
-    names=[],
-    subsets=[""],
+    names=None,
+    subsets=None,
     s3_url_prefix=None,
     recursive=True,
     filter_str="tar",
     debug=False,
-    profiles={},
+    profiles=None,
+    s3_streaming_configs=None,
 ):
     "get urls of shards (tar files) for multiple datasets in one s3 bucket"
+    names = names or []
+    subsets = subsets or [""]
+    profiles = profiles or {}
+    s3_streaming_configs = s3_streaming_configs or {}
     urls = []
 
     for name in names:
@@ -887,22 +996,24 @@ def get_all_s3_urls(
                 filter=filter_str,
                 debug=debug,
                 profile=profile,
+                s3_streaming_config=s3_streaming_configs.get(name),
             )
 
             for tar in tar_list:
-                tar = tar.replace(" ", r"\ ").replace("(", r"\(").replace(")", r"\)")
-                s3_path = posixpath.join(name, subset, tar) + " -"
+                s3_path = posixpath.join(name, subset, tar)
 
                 if s3_url_prefix is None:
-                    request_str = f"pipe:aws s3 --cli-connect-timeout 0 cp {s3_path}"
-                else:
-                    request_str = (
-                        f"pipe:aws s3 --cli-connect-timeout 0 cp "
-                        f"{posixpath.join(s3_url_prefix, s3_path)}"
+                    request_str = build_s3_pipe_request(
+                        s3_path,
+                        profile=profiles.get(name),
+                        s3_streaming_config=s3_streaming_configs.get(name),
                     )
-
-                if profiles.get(name):
-                    request_str += f" --profile {profiles.get(name)}"
+                else:
+                    request_str = build_s3_pipe_request(
+                        posixpath.join(s3_url_prefix, s3_path),
+                        profile=profiles.get(name),
+                        s3_streaming_config=s3_streaming_configs.get(name),
+                    )
 
                 if debug:
                     print("request_str = ", request_str)
@@ -1168,7 +1279,7 @@ class WebDatasetDataLoader:
         return sample
 
 
-def create_webdataset_configs(dataset_entries, dataset_type):
+def create_webdataset_configs(dataset_entries, dataset_type, s3_streaming_defaults=None):
     configs = []
 
     for wds_config in dataset_entries:
@@ -1198,12 +1309,16 @@ def create_webdataset_configs(dataset_entries, dataset_type):
             s3_path = wds_config.get("s3_path", None)
             assert s3_path is not None, "s3_path must be set for S3 WebDataset configuration"
 
+            s3_streaming_config = dict(s3_streaming_defaults or {})
+            s3_streaming_config.update(wds_config.get("s3_streaming", {}))
+
             configs.append(
                 S3DatasetConfig(
                     id=wds_config["id"],
                     s3_path=s3_path,
                     custom_metadata_fn=custom_metadata_fn,
                     profile=wds_config.get("profile", None),
+                    s3_streaming_config=s3_streaming_config,
                 )
             )
 
@@ -1623,7 +1738,11 @@ def create_dataloader_from_config(
         train_dataset_entries = dataset_config.get("datasets", None)
         assert train_dataset_entries is not None, "WebDataset configuration must be specified in datasets"
 
-        wds_configs = create_webdataset_configs(train_dataset_entries, dataset_type)
+        wds_configs = create_webdataset_configs(
+            train_dataset_entries,
+            dataset_type,
+            s3_streaming_defaults=dataset_config.get("s3_streaming", None),
+        )
 
         train_dl = WebDatasetDataLoader(
             wds_configs,
@@ -1652,7 +1771,11 @@ def create_dataloader_from_config(
                 datasets_valid = [datasets_valid]
 
             for dataset_valid_group in datasets_valid:
-                valid_configs = create_webdataset_configs(dataset_valid_group, dataset_type)
+                valid_configs = create_webdataset_configs(
+                    dataset_valid_group,
+                    dataset_type,
+                    s3_streaming_defaults=dataset_config.get("s3_streaming", None),
+                )
                 valid_dl = WebDatasetDataLoader(
                     valid_configs,
                     sample_rate=sample_rate,
