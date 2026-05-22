@@ -31,6 +31,7 @@ from .utils import Stereo, Mono, PhaseFlipper, PadCrop_Normalized_T
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
 
 AUDIO_KEYS = ("flac", "wav", "mp3", "m4a", "ogg", "opus")
+RANDOM_PROMPT_KEYS = ("dense_caption", "vivid_caption", "one_line_caption")
 DEFAULT_S3_STREAMING_CONFIG = {
     "cli_connect_timeout_sec": 30,
     "cli_read_timeout_sec": 120,
@@ -135,6 +136,38 @@ def audio_decoder(key, value):
         return None
 
 
+def is_valid_prompt_value(prompt):
+    if prompt is None:
+        return False
+
+    if isinstance(prompt, str):
+        return bool(prompt.strip())
+
+    return True
+
+
+def has_random_prompt_fields(metadata):
+    return all(is_valid_prompt_value(metadata.get(key)) for key in RANDOM_PROMPT_KEYS)
+
+
+def has_any_random_prompt_field(metadata):
+    return any(key in metadata for key in RANDOM_PROMPT_KEYS)
+
+
+def select_random_batch_prompt(metadata_batch):
+    if not all(has_random_prompt_fields(metadata) for metadata in metadata_batch):
+        return metadata_batch
+
+    prompt_key = random.choice(RANDOM_PROMPT_KEYS)
+    return [
+        {
+            **metadata,
+            "prompt": metadata[prompt_key],
+        }
+        for metadata in metadata_batch
+    ]
+
+
 def collation_fn(samples):
     samples = [sample for sample in samples if sample is not None]
     if not samples:
@@ -149,6 +182,8 @@ def collation_fn(samples):
             b = torch.stack(b)
         elif isinstance(b[0], np.ndarray):
             b = np.array(b)
+        elif isinstance(b[0], dict) and all(isinstance(item, dict) for item in b):
+            b = select_random_batch_prompt(b)
         else:
             b = b
         result.append(b)
@@ -974,6 +1009,27 @@ def get_all_s3_urls(
     s3_streaming_configs = s3_streaming_configs or {}
     urls = []
 
+    def make_s3_cp_source(name, subset, tar):
+        tar = tar.strip()
+
+        if tar.startswith("s3://"):
+            return tar
+
+        if s3_url_prefix is None:
+            base = name
+        else:
+            base = posixpath.join(s3_url_prefix, name)
+
+        if tar.startswith("/"):
+            if subset:
+                tar = tar.lstrip("/")
+                if tar.startswith(f"{subset}/"):
+                    tar = tar[len(subset) + 1:]
+            else:
+                return posixpath.join(base.rstrip("/"), tar.lstrip("/"))
+
+        return posixpath.join(base, subset, tar)
+
     for name in names:
         if s3_url_prefix is None:
             contents_str = name
@@ -1000,20 +1056,13 @@ def get_all_s3_urls(
             )
 
             for tar in tar_list:
-                s3_path = posixpath.join(name, subset, tar)
+                s3_path = make_s3_cp_source(name, subset, tar)
 
-                if s3_url_prefix is None:
-                    request_str = build_s3_pipe_request(
-                        s3_path,
-                        profile=profiles.get(name),
-                        s3_streaming_config=s3_streaming_configs.get(name),
-                    )
-                else:
-                    request_str = build_s3_pipe_request(
-                        posixpath.join(s3_url_prefix, s3_path),
-                        profile=profiles.get(name),
-                        s3_streaming_config=s3_streaming_configs.get(name),
-                    )
+                request_str = build_s3_pipe_request(
+                    s3_path,
+                    profile=profiles.get(name),
+                    s3_streaming_config=s3_streaming_configs.get(name),
+                )
 
                 if debug:
                     print("request_str = ", request_str)
@@ -1044,18 +1093,10 @@ def is_valid_sample(sample):
 
 
 def has_valid_prompt(metadata):
-    if "prompt" not in metadata:
-        return False
+    if has_any_random_prompt_field(metadata):
+        return has_random_prompt_fields(metadata)
 
-    prompt = metadata["prompt"]
-
-    if prompt is None:
-        return False
-
-    if isinstance(prompt, str):
-        return bool(prompt.strip())
-
-    return True
+    return is_valid_prompt_value(metadata.get("prompt"))
 
 
 class WebDatasetDataLoader:
