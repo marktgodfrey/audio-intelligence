@@ -294,6 +294,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         optimizer_configs: dict = None,
         pre_encoded: bool = False,
         cfg_dropout_prob=0.1,
+        conditioning_dropout_probs: tp.Optional[tp.Dict[str, float]] = None,
         timestep_sampler: tp.Literal["uniform", "logit_normal"] = "uniform",
     ):
         super().__init__()
@@ -316,6 +317,9 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         self.mask_padding_dropout = mask_padding_dropout
 
         self.cfg_dropout_prob = cfg_dropout_prob
+        self.conditioning_dropout_probs = self._validate_conditioning_dropout_probs(
+            conditioning_dropout_probs
+        )
 
         self.rng = torch.quasirandom.SobolEngine(1, scramble=True)
 
@@ -355,6 +359,56 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
 
         self.pre_encoded = pre_encoded
         self._last_nonfinite_debug = None
+
+    def _validate_conditioning_dropout_probs(
+        self, conditioning_dropout_probs: tp.Optional[tp.Dict[str, float]]
+    ) -> tp.Dict[str, float]:
+        if conditioning_dropout_probs is None:
+            return {}
+
+        validated = {}
+        for key, prob in conditioning_dropout_probs.items():
+            prob = float(prob)
+            if prob < 0.0 or prob > 1.0:
+                raise ValueError(
+                    f"Conditioning dropout probability for {key} must be between 0 and 1, got {prob}"
+                )
+            if prob > 0.0:
+                validated[str(key)] = prob
+
+        return validated
+
+    def _apply_conditioning_dropout(self, conditioning: tp.Dict[str, tp.Any]):
+        for key, prob in self.conditioning_dropout_probs.items():
+            if key not in conditioning:
+                raise ValueError(
+                    f"Conditioning dropout configured for {key}, but it was not found in conditioning tensors"
+                )
+
+            cond_value = conditioning[key]
+            if not isinstance(cond_value, (list, tuple)) or len(cond_value) == 0:
+                raise TypeError(
+                    f"Conditioning tensor for {key} must be a non-empty list or tuple"
+                )
+
+            cond_tensor = cond_value[0]
+            if not torch.is_tensor(cond_tensor):
+                raise TypeError(
+                    f"Conditioning tensor for {key} must be a torch.Tensor, got {type(cond_tensor).__name__}"
+                )
+
+            drop_shape = (cond_tensor.shape[0],) + (1,) * (cond_tensor.ndim - 1)
+            dropout_mask = torch.rand(drop_shape, device=cond_tensor.device) < prob
+            dropped_tensor = torch.where(
+                dropout_mask, torch.zeros_like(cond_tensor), cond_tensor
+            )
+
+            if isinstance(cond_value, tuple):
+                conditioning[key] = (dropped_tensor, *cond_value[1:])
+            else:
+                cond_value[0] = dropped_tensor
+
+        return conditioning
 
     def _debug_rank(self):
         rank = getattr(self, "global_rank", None)
@@ -550,6 +604,7 @@ class DiffusionCondTrainingWrapper(pl.LightningModule):
         # with torch.amp.autocast('cuda'):
         try:
             conditioning = self.diffusion.conditioner(metadata, self.device)
+            conditioning = self._apply_conditioning_dropout(conditioning)
         except Exception as exc:
             self._record_batch_debug(
                 batch_idx=batch_idx,

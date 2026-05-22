@@ -79,6 +79,7 @@ def create_training_wrapper_from_config(model_config, model):
             optimizer_configs=training_config.get("optimizer_configs", None),
             pre_encoded=training_config.get("pre_encoded", False),
             cfg_dropout_prob = training_config.get("cfg_dropout_prob", 0.1),
+            conditioning_dropout_probs=training_config.get("conditioning_dropout_probs", None),
             timestep_sampler = training_config.get("timestep_sampler", "uniform"),
         )
     elif model_type == 'diffusion_prior':
