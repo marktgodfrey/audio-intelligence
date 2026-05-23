@@ -32,6 +32,17 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_only
 
 AUDIO_KEYS = ("flac", "wav", "mp3", "m4a", "ogg", "opus")
 RANDOM_PROMPT_KEYS = ("dense_caption", "vivid_caption", "one_line_caption")
+CAPTION_BUCKET_PROBS = (
+    ("dense", 0.30),
+    ("vivid", 0.375),
+    ("one_line", 0.325),
+)
+DENSE_POLICY_PROBS = (
+    ("keep_structured_heading", 0.40),
+    ("omit_structured_heading", 0.30),
+    ("replace_with_simple_prefix", 0.30),
+)
+BPM_NUMERIC_ACTIVE_PROB = 0.70
 DEFAULT_S3_STREAMING_CONFIG = {
     "cli_connect_timeout_sec": 30,
     "cli_read_timeout_sec": 120,
@@ -154,16 +165,143 @@ def has_any_random_prompt_field(metadata):
     return any(key in metadata for key in RANDOM_PROMPT_KEYS)
 
 
+def sample_weighted_choice(weighted_items):
+    total_weight = sum(weight for _, weight in weighted_items)
+    draw = random.random() * total_weight
+    cumulative = 0.0
+
+    for item, weight in weighted_items:
+        cumulative += weight
+        if draw < cumulative:
+            return item
+
+    return weighted_items[-1][0]
+
+
+def strip_structured_heading(caption):
+    if not isinstance(caption, str):
+        return caption
+
+    lines = caption.splitlines()
+    first_content_ix = None
+
+    for ix, line in enumerate(lines):
+        if line.strip():
+            first_content_ix = ix
+            break
+
+    if first_content_ix is None:
+        return caption
+
+    genre_ix = first_content_ix
+    if not re.match(r"^\s*Genre\s*:", lines[genre_ix], flags=re.IGNORECASE):
+        return caption.strip()
+
+    end_ix = genre_ix + 1
+    while end_ix < len(lines):
+        stripped = lines[end_ix].strip()
+
+        if not stripped:
+            end_ix += 1
+            break
+
+        if re.match(r"^\s*Sub[- ]?genres?\s*:", lines[end_ix], flags=re.IGNORECASE):
+            end_ix += 1
+            continue
+
+        break
+
+    return "\n".join(lines[end_ix:]).strip()
+
+
+def coerce_subgenres(subgenres):
+    if subgenres is None:
+        return []
+
+    if isinstance(subgenres, str):
+        return [item.strip() for item in subgenres.split(",") if item.strip()]
+
+    if isinstance(subgenres, (list, tuple)):
+        return [str(item).strip() for item in subgenres if str(item).strip()]
+
+    return []
+
+
+def make_simple_genre_prefix(metadata):
+    main = metadata.get("genre") or metadata.get("primary_genre")
+    if not main:
+        return ""
+
+    main = str(main).strip()
+    subgenres = [
+        subgenre
+        for subgenre in coerce_subgenres(metadata.get("subgenres"))
+        if subgenre.lower() != main.lower()
+    ][:3]
+
+    if subgenres:
+        return f"{main}: {', '.join(subgenres)}."
+
+    return f"{main}."
+
+
+def is_truthy_metadata_value(value):
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "t", "yes", "y"}
+
+    return bool(value)
+
+
+def build_ttm_condition(metadata):
+    bucket = sample_weighted_choice(CAPTION_BUCKET_PROBS)
+
+    if bucket == "dense":
+        dense_caption = metadata["dense_caption"]
+        dense_prose = strip_structured_heading(dense_caption)
+        policy = sample_weighted_choice(DENSE_POLICY_PROBS)
+
+        if policy == "keep_structured_heading":
+            text = dense_caption
+        elif policy == "omit_structured_heading":
+            text = dense_prose
+        else:
+            prefix = make_simple_genre_prefix(metadata)
+            text = f"{prefix} {dense_prose}".strip() if prefix else dense_prose
+    elif bucket == "vivid":
+        text = metadata["vivid_caption"]
+    else:
+        text = metadata["one_line_caption"]
+
+    tempo = None
+
+    if is_truthy_metadata_value(metadata.get("bpm_valid")):
+        try:
+            bpm = round(float(metadata["bpm"]))
+        except (KeyError, TypeError, ValueError):
+            bpm = None
+
+        if bpm is not None:
+            if bucket in {"dense", "vivid"}:
+                text = f"{bpm} BPM. {text}"
+            else:
+                text = f"{bpm} BPM {text}"
+
+            if random.random() < BPM_NUMERIC_ACTIVE_PROB:
+                tempo = bpm
+
+    return {
+        **metadata,
+        "prompt": text,
+        "tempo": tempo,
+    }
+
+
 def select_random_batch_prompt(metadata_batch):
     if not all(has_random_prompt_fields(metadata) for metadata in metadata_batch):
         return metadata_batch
 
-    prompt_key = random.choice(RANDOM_PROMPT_KEYS)
     return [
-        {
-            **metadata,
-            "prompt": metadata[prompt_key],
-        }
+        build_ttm_condition(metadata)
         for metadata in metadata_batch
     ]
 

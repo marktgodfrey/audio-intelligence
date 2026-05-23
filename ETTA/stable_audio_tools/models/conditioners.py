@@ -18,6 +18,23 @@ from .utils import load_ckpt_state_dict
 
 from torch import nn
 
+
+def is_null_conditioning_value(value: tp.Any) -> bool:
+    if value is None:
+        return True
+
+    if torch.is_tensor(value):
+        return bool(value.numel() == 0)
+
+    if isinstance(value, str):
+        return value.strip().lower() in {"", "none", "null", "nan"}
+
+    try:
+        return bool(value != value)
+    except TypeError:
+        return False
+
+
 class Conditioner(nn.Module):
     def __init__(
             self,
@@ -50,13 +67,20 @@ class IntConditioner(Conditioner):
     def forward(self, ints: tp.List[int], device=None) -> tp.Any:
             
             #self.int_embedder.to(device)
-    
+
+            valid_mask = torch.tensor(
+                [not is_null_conditioning_value(x) for x in ints],
+                device=device,
+                dtype=torch.float32,
+            )
+            ints = [self.min_val if is_null_conditioning_value(x) else int(x) for x in ints]
             ints = torch.tensor(ints).to(device)
             ints = ints.clamp(self.min_val, self.max_val)
     
             int_embeds = self.int_embedder(ints).unsqueeze(1)
+            int_embeds = int_embeds * valid_mask.to(int_embeds.dtype).view(-1, 1, 1)
     
-            return [int_embeds, torch.ones(int_embeds.shape[0], 1).to(device)]
+            return [int_embeds, valid_mask.view(-1, 1)]
 
 class NumberConditioner(Conditioner):
     '''
@@ -77,6 +101,12 @@ class NumberConditioner(Conditioner):
     def forward(self, floats: tp.List[float], device=None) -> tp.Any:
     
             # Cast the inputs to floats
+            valid_mask = torch.tensor(
+                [not is_null_conditioning_value(x) for x in floats],
+                device=device,
+                dtype=torch.float32,
+            )
+            floats = [self.min_val if is_null_conditioning_value(x) else x for x in floats]
             floats = [float(x) for x in floats]
 
             floats = torch.tensor(floats).to(device)
@@ -90,8 +120,9 @@ class NumberConditioner(Conditioner):
             normalized_floats = normalized_floats.to(embedder_dtype)
 
             float_embeds = self.embedder(normalized_floats).unsqueeze(1)
+            float_embeds = float_embeds * valid_mask.to(float_embeds.dtype).view(-1, 1, 1)
     
-            return [float_embeds, torch.ones(float_embeds.shape[0], 1).to(device)]
+            return [float_embeds, valid_mask.view(-1, 1)]
 
 class CLAPTextConditioner(Conditioner):
     def __init__(self, 
@@ -496,6 +527,9 @@ class MultiConditioner(nn.Module):
                 if condition_key not in x:
                     if condition_key in self.default_keys:
                         condition_key = self.default_keys[condition_key]
+                    elif isinstance(conditioner, (IntConditioner, NumberConditioner)):
+                        conditioner_inputs.append(None)
+                        continue
                     else:
                         raise ValueError(f"Conditioner key {condition_key} not found in batch metadata")
 
