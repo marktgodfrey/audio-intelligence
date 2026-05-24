@@ -9,7 +9,7 @@ import time
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Stream an S3 object to stdout with bounded AWS and process timeouts."
+        description="Stream an S3 object to stdout with bounded AWS and idle timeouts."
     )
     parser.add_argument("--s3-path", required=True)
     parser.add_argument("--profile")
@@ -81,21 +81,12 @@ def stream_s3_object(args):
 
     stdout_fd = process.stdout.fileno()
     output_fd = sys.stdout.fileno()
-    start_time = time.monotonic()
-    last_progress_time = start_time
+    last_progress_time = time.monotonic()
 
     try:
         while True:
             now = time.monotonic()
-            total_elapsed = now - start_time
             idle_elapsed = now - last_progress_time
-
-            if total_elapsed > args.stream_timeout_sec:
-                terminate_process_group(process)
-                raise TimeoutError(
-                    f"S3 shard stream exceeded total timeout of {args.stream_timeout_sec}s "
-                    f"for {args.s3_path}"
-                )
 
             if idle_elapsed > args.stream_idle_timeout_sec:
                 terminate_process_group(process)
@@ -106,7 +97,6 @@ def stream_s3_object(args):
 
             wait_timeout = min(
                 1.0,
-                args.stream_timeout_sec - total_elapsed,
                 args.stream_idle_timeout_sec - idle_elapsed,
             )
             wait_timeout = max(wait_timeout, 0.0)
